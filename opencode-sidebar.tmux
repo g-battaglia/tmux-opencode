@@ -34,5 +34,11 @@ tmux set-option -g @opencode-sidebar-width "$width"
 tmux set-option -g @opencode-refresh-interval "$refresh"
 tmux set-option -g @opencode-cpu-threshold "$cpu_threshold"
 
-# Register keybinding
-tmux bind-key "$key" run-shell "$CURRENT_DIR/scripts/toggle.sh"
+# Register keybinding.
+# if-shell checks whether sidebar exists:
+#   - true  -> close it via run-shell
+#   - false -> open it via split-window (needs window context, which if-shell provides)
+tmux bind-key "$key" \
+  if-shell "$CURRENT_DIR/scripts/check.sh" \
+    "run-shell '$CURRENT_DIR/scripts/close.sh'" \
+    "split-window -hbf -l $width '$CURRENT_DIR/scripts/render.sh'"

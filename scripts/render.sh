@@ -3,7 +3,8 @@
 # render.sh - Main rendering loop for the tmux-opencode sidebar
 # Runs inside the sidebar pane, refreshes periodically, handles navigation
 
-set -euo pipefail
+# Note: NOT using set -e because read -t returns >128 on timeout
+set -uo pipefail
 
 # ── Colors ──────────────────────────────────────────────────────
 RESET="\033[0m"
@@ -33,6 +34,9 @@ CPU_THRESHOLD="$(get_option "@opencode-cpu-threshold" "5")"
 WIDTH="$(get_option "@opencode-sidebar-width" "32")"
 SIDEBAR_PANE="$(tmux display-message -p '#{pane_id}')"
 
+# Self-register: store our pane ID so toggle.sh can find us
+tmux set-option -g @opencode-sidebar-pane "$SIDEBAR_PANE"
+
 # ── State ───────────────────────────────────────────────────────
 cursor=0
 declare -a item_types=()     # "header" | "window"
@@ -42,7 +46,7 @@ declare -a item_statuses=()  # "working" | "idle" | "done" | "error" | ""
 
 # ── Cleanup ─────────────────────────────────────────────────────
 cleanup() {
-  tmux set-option -u @opencode-sidebar-pane 2>/dev/null || true
+  tmux set-option -gu @opencode-sidebar-pane 2>/dev/null || true
   tput cnorm 2>/dev/null || true
 }
 trap 'cleanup; exit 0' EXIT INT TERM
