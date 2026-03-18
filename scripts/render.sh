@@ -2,20 +2,27 @@
 
 # render.sh - Main rendering loop for the tmux-opencode sidebar
 # Runs inside the sidebar pane, refreshes periodically, handles navigation
+#
+# Architecture:
+#   - Input via read -t 1 (returns instantly on keypress, 1s timeout on idle)
+#   - Data (tmux sessions/panes/CPU) refreshed every N idle cycles
+#   - Uses cursor-home + clear-to-EOL to avoid flicker (no full clear)
+#   - Full frame buffered then flushed at once
 
 # Note: NOT using set -e because read -t returns >128 on timeout
 set -uo pipefail
 
-# ── Colors ──────────────────────────────────────────────────────
-RESET="\033[0m"
-BOLD="\033[1m"
-DIM="\033[2m"
-YELLOW="\033[33m"
-GREEN="\033[32m"
-RED="\033[31m"
-CYAN="\033[36m"
-WHITE="\033[37m"
-BG_SELECT="\033[48;5;236m"
+# ── Colors (ANSI) ───────────────────────────────────────────────
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+YELLOW=$'\033[33m'
+GREEN=$'\033[32m'
+RED=$'\033[31m'
+CYAN=$'\033[36m'
+WHITE=$'\033[37m'
+BG_SELECT=$'\033[48;5;236m'
+CLR=$'\033[K'
 
 # ── Symbols ─────────────────────────────────────────────────────
 DOT="●"
@@ -29,53 +36,52 @@ get_option() {
   [ -n "$value" ] && echo "$value" || echo "$2"
 }
 
-REFRESH="$(get_option "@opencode-refresh-interval" "2")"
+REFRESH_SECS="$(get_option "@opencode-refresh-interval" "3")"
 CPU_THRESHOLD="$(get_option "@opencode-cpu-threshold" "5")"
 WIDTH="$(get_option "@opencode-sidebar-width" "32")"
 SIDEBAR_PANE="$(tmux display-message -p '#{pane_id}')"
 
-# Self-register: store our pane ID so toggle.sh can find us
+# Self-register so check.sh/close.sh can find us
 tmux set-option -g @opencode-sidebar-pane "$SIDEBAR_PANE"
 
 # ── State ───────────────────────────────────────────────────────
 cursor=0
-declare -a item_types=()     # "header" | "window"
-declare -a item_targets=()   # tmux target (session:win) for windows, empty for headers
-declare -a item_displays=()  # formatted display text
-declare -a item_statuses=()  # "working" | "idle" | "done" | "error" | ""
+needs_redraw=1
+idle_ticks=0
+
+declare -a item_types=()
+declare -a item_targets=()
+declare -a item_displays=()
+declare -a item_statuses=()
 
 # ── Cleanup ─────────────────────────────────────────────────────
 cleanup() {
   tmux set-option -gu @opencode-sidebar-pane 2>/dev/null || true
   tput cnorm 2>/dev/null || true
+  printf "\033[?7h"  # re-enable line wrap
 }
 trap 'cleanup; exit 0' EXIT INT TERM
 
-# Hide cursor
+# Hide cursor, disable line wrap
 tput civis 2>/dev/null || true
+printf "\033[?7l"
 
 # ── Functions ───────────────────────────────────────────────────
 
-# Get the opencode process status for a pane
-# Looks at pane_current_command, then checks CPU of the actual opencode PID
 get_opencode_status() {
   local pane_pid="$1"
   local pane_cmd="$2"
   local pane_id="$3"
 
   if [ "$pane_cmd" = "opencode" ]; then
-    # opencode is the foreground process -- find its actual PID
     local oc_pid
     oc_pid="$(pgrep -P "$pane_pid" -x opencode 2>/dev/null | head -1)"
-
-    # Fallback: if pgrep didn't find a child, the shell may have been replaced
     [ -z "$oc_pid" ] && oc_pid="$pane_pid"
 
     local cpu
     cpu="$(ps -p "$oc_pid" -o %cpu= 2>/dev/null | tr -d ' ')"
     [ -z "$cpu" ] && return
 
-    # Integer comparison (strip decimal)
     local cpu_int="${cpu%%.*}"
     [ -z "$cpu_int" ] && cpu_int=0
 
@@ -87,7 +93,7 @@ get_opencode_status() {
     return
   fi
 
-  # opencode is NOT the foreground process -- check exit code from wrapper
+  # Check exit code from wrapper (oc function)
   local exitfile="/tmp/tmux-opencode/${pane_id//[^%0-9]/}"
   if [ -f "$exitfile" ]; then
     local code
@@ -100,8 +106,14 @@ get_opencode_status() {
   fi
 }
 
-# Collect data from all sessions/windows/panes
 collect_data() {
+  # Snapshot old state to detect changes
+  local old_snap=""
+  local i
+  for i in "${!item_displays[@]}"; do
+    old_snap+="${item_displays[$i]}:${item_statuses[$i]}|"
+  done
+
   item_types=()
   item_targets=()
   item_displays=()
@@ -117,13 +129,11 @@ collect_data() {
   while IFS= read -r session; do
     [ -z "$session" ] && continue
 
-    # Session header
     item_types+=("header")
     item_targets+=("")
     item_displays+=("$session")
     item_statuses+=("")
 
-    # Windows in this session
     local windows
     windows="$(tmux list-windows -t "$session" -F '#{window_index}|#{window_name}' 2>/dev/null)" || continue
 
@@ -131,38 +141,25 @@ collect_data() {
       [ -z "$win_idx" ] && continue
 
       local target="${session}:${win_idx}"
-
-      # Check all panes in this window for opencode
       local best_status=""
       local panes
       panes="$(tmux list-panes -t "$target" -F '#{pane_id}|#{pane_pid}|#{pane_current_command}' 2>/dev/null)" || continue
 
       while IFS='|' read -r p_id p_pid p_cmd; do
-        # Skip the sidebar pane
         [ "$p_id" = "$SIDEBAR_PANE" ] && continue
         [ -z "$p_pid" ] && continue
 
         local status
         status="$(get_opencode_status "$p_pid" "$p_cmd" "$p_id")"
 
-        # Priority: working > error > idle/done > ""
         case "$status" in
-          working)
-            best_status="working"
-            ;;
-          error)
-            [ "$best_status" != "working" ] && best_status="error"
-            ;;
-          idle)
-            [ "$best_status" != "working" ] && [ "$best_status" != "error" ] && best_status="idle"
-            ;;
-          done)
-            [ "$best_status" != "working" ] && [ "$best_status" != "error" ] && [ "$best_status" != "idle" ] && best_status="done"
-            ;;
+          working) best_status="working" ;;
+          error)   [ "$best_status" != "working" ] && best_status="error" ;;
+          idle)    [ "$best_status" != "working" ] && [ "$best_status" != "error" ] && best_status="idle" ;;
+          done)    [ "$best_status" != "working" ] && [ "$best_status" != "error" ] && [ "$best_status" != "idle" ] && best_status="done" ;;
         esac
       done <<< "$panes"
 
-      # Mark current window
       local marker=""
       if [ "$session" = "$current_session" ] && [ "$win_idx" = "$current_window" ]; then
         marker=" *"
@@ -175,9 +172,15 @@ collect_data() {
     done <<< "$windows"
 
   done <<< "$sessions"
+
+  # Trigger redraw only if data changed
+  local new_snap=""
+  for i in "${!item_displays[@]}"; do
+    new_snap+="${item_displays[$i]}:${item_statuses[$i]}|"
+  done
+  [ "$old_snap" != "$new_snap" ] && needs_redraw=1
 }
 
-# Count navigable items (windows only, not headers)
 count_navigable() {
   local count=0
   for t in "${item_types[@]}"; do
@@ -186,7 +189,6 @@ count_navigable() {
   echo "$count"
 }
 
-# Get the tmux target for the item at the current cursor position
 get_selected_target() {
   local nav=0
   for i in "${!item_types[@]}"; do
@@ -200,19 +202,20 @@ get_selected_target() {
   done
 }
 
-# Render the sidebar
+# Build entire frame into a buffer, flush at once (zero flicker)
 render() {
-  printf "\033[2J\033[H"  # clear + home
+  local buf=""
+  local max_name=$((WIDTH - 10))
 
-  # Header
-  printf "\n"
-  printf "  ${BOLD}${CYAN}OPENCODE${RESET}\n"
-  printf "  ${DIM}"
+  buf+="\033[H"  # cursor home (overwrite in place, no clear)
+  buf+="\n"
+  buf+="  ${BOLD}${CYAN}OPENCODE${RESET}${CLR}\n"
+  buf+="  ${DIM}"
   local i
   for ((i = 0; i < WIDTH - 4; i++)); do
-    printf "%s" "$DASH"
+    buf+="$DASH"
   done
-  printf "${RESET}\n"
+  buf+="${RESET}\n"
 
   local nav=0
   local prev_type=""
@@ -223,11 +226,10 @@ render() {
     local status="${item_statuses[$i]}"
 
     if [ "$type" = "header" ]; then
-      # Add spacing between sessions
-      [ -n "$prev_type" ] && printf "\n"
-      printf "  ${BOLD}${WHITE}%s${RESET}\n" "$display"
+      [ -n "$prev_type" ] && buf+="\n"
+      buf+="  ${BOLD}${WHITE}${display}${RESET}${CLR}\n"
+
     elif [ "$type" = "window" ]; then
-      # Status indicator
       local indicator=" "
       case "$status" in
         working) indicator="${YELLOW}${DOT}${RESET}" ;;
@@ -236,17 +238,19 @@ render() {
         error)   indicator="${RED}${DOT}${RESET}" ;;
       esac
 
-      # Truncate long names
-      local max_len=$((WIDTH - 8))
-      if [ "${#display}" -gt "$max_len" ]; then
-        display="${display:0:$((max_len - 1))}.."
+      # Truncate
+      if [ "${#display}" -gt "$max_name" ]; then
+        display="${display:0:$((max_name - 2))}.."
       fi
 
-      # Render line (highlighted if selected)
+      # Pad to fixed width
+      local padded
+      padded="$(printf "%-${max_name}s" "$display")"
+
       if [ "$nav" -eq "$cursor" ]; then
-        printf "  ${BG_SELECT}${WHITE}${LINE_V} %-$((WIDTH - 6))s %b ${RESET}\n" "$display" "$indicator"
+        buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${indicator}  ${RESET}${CLR}\n"
       else
-        printf "  ${DIM}${LINE_V}${RESET} %-$((WIDTH - 6))s %b\n" "$display" "$indicator"
+        buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${indicator}${CLR}\n"
       fi
 
       nav=$((nav + 1))
@@ -255,12 +259,13 @@ render() {
     prev_type="$type"
   done
 
-  # Footer
-  printf "\n"
-  printf "  ${DIM}j/k move  enter go  q close${RESET}\n"
+  buf+="\n"
+  buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
+  buf+="\033[J"  # clear everything below
+
+  printf "%b" "$buf"
 }
 
-# Switch to the selected window and close sidebar
 switch_to_selected() {
   local target
   target="$(get_selected_target)"
@@ -275,47 +280,67 @@ switch_to_selected() {
 
 # ── Main Loop ───────────────────────────────────────────────────
 
-while true; do
-  collect_data
+# Initial data load
+collect_data
+needs_redraw=1
 
+while true; do
   # Clamp cursor
   max="$(count_navigable)"
   [ "$max" -eq 0 ] && max=1
   [ "$cursor" -ge "$max" ] && cursor=$((max - 1))
   [ "$cursor" -lt 0 ] && cursor=0
 
-  render
-
-  # Wait for input or refresh timeout
-  key=""
-  IFS= read -rsn1 -t "$REFRESH" key
-  read_exit=$?
-
-  if [ "$read_exit" -eq 0 ]; then
-    # Got input
-    if [ -z "$key" ]; then
-      # Enter key (empty string, exit 0)
-      switch_to_selected
-    else
-      case "$key" in
-        j) cursor=$((cursor + 1)) ;;
-        k) cursor=$((cursor - 1)) ;;
-        G) cursor=$(($(count_navigable) - 1)) ;;  # go to bottom
-        q)
-          tmux kill-pane -t "$SIDEBAR_PANE" 2>/dev/null || true
-          exit 0
-          ;;
-        $'\x1b')
-          # Escape sequence -- read arrow keys
-          seq=""
-          IFS= read -rsn2 -t 0.1 seq 2>/dev/null || true
-          case "$seq" in
-            '[A') cursor=$((cursor - 1)) ;;  # Up
-            '[B') cursor=$((cursor + 1)) ;;  # Down
-          esac
-          ;;
-      esac
-    fi
+  # Redraw only when needed
+  if [ "$needs_redraw" -eq 1 ]; then
+    render
+    needs_redraw=0
   fi
-  # else: timeout, just refresh
+
+  # Wait for input (instant on keypress, 1s timeout on idle)
+  # Capture exit code BEFORE || true masks it:
+  #   0   = got a character (or Enter which gives empty string)
+  #   1   = EOF
+  #   >128 = timeout
+  key=""
+  rc=0
+  IFS= read -rsn1 -t 1 key || rc=$?
+
+  if [ "$rc" -gt 128 ]; then
+    # Timeout -- no input for 1 second, count toward data refresh
+    idle_ticks=$((idle_ticks + 1))
+    if [ "$idle_ticks" -ge "$REFRESH_SECS" ]; then
+      idle_ticks=0
+      collect_data
+    fi
+  elif [ -z "$key" ]; then
+    # Enter key (read returned 0 with empty string)
+    switch_to_selected
+  else
+    # Got a character
+    case "$key" in
+      j) cursor=$((cursor + 1)); needs_redraw=1 ;;
+      k) cursor=$((cursor - 1)); needs_redraw=1 ;;
+      G) cursor=$(($(count_navigable) - 1)); needs_redraw=1 ;;
+      g) cursor=0; needs_redraw=1 ;;
+      q)
+        tmux kill-pane -t "$SIDEBAR_PANE" 2>/dev/null || true
+        exit 0
+        ;;
+      $'\x1b')
+        # Arrow key: ESC [ A/B
+        bracket=""
+        IFS= read -rsn1 -t 1 bracket 2>/dev/null || true
+        if [ "$bracket" = "[" ]; then
+          arrow=""
+          IFS= read -rsn1 -t 1 arrow 2>/dev/null || true
+          case "$arrow" in
+            A) cursor=$((cursor - 1)); needs_redraw=1 ;;  # Up
+            B) cursor=$((cursor + 1)); needs_redraw=1 ;;  # Down
+          esac
+        fi
+        ;;
+    esac
+    idle_ticks=0
+  fi
 done
