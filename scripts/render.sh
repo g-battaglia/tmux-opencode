@@ -56,10 +56,17 @@ item_displays=()
 item_statuses=()
 
 # ── Terminal Setup ──────────────────────────────────────────────
+# Save terminal state and disable echo + canonical mode
+# -echo: prevents arrow key bytes from appearing on screen
+# -icanon: char-at-a-time input (no line buffering)
+# Keeps opost enabled so \n works correctly in output
+saved_stty="$(stty -g 2>/dev/null)"
+stty -echo -icanon 2>/dev/null
+
 # Enter alternate screen buffer (like vim/less/htop)
 printf "\033[?1049h"
 # Hide cursor
-tput civis 2>/dev/null || true
+printf "\033[?25l"
 # Disable line wrap
 printf "\033[?7l"
 
@@ -67,8 +74,9 @@ printf "\033[?7l"
 cleanup() {
   tmux set-option -gu @opencode-sidebar-pane 2>/dev/null || true
   printf "\033[?7h"        # re-enable line wrap
-  tput cnorm 2>/dev/null || true
+  printf "\033[?25h"       # show cursor
   printf "\033[?1049l"     # leave alternate screen buffer
+  stty "$saved_stty" 2>/dev/null || stty sane 2>/dev/null  # restore terminal
 }
 trap 'cleanup; exit 0' EXIT INT TERM
 
