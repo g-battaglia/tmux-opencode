@@ -1,43 +1,46 @@
 #!/usr/bin/env bash
 
-# tmux-opencode: sidebar plugin for monitoring OpenCode sessions
+# ============================================================================
+# tmux-opencode - A tmux sidebar for monitoring OpenCode sessions
 # https://github.com/g-battaglia/tmux-opencode
+#
+# Entry point for TPM (Tmux Plugin Manager).
+# Reads user config, stores it in tmux env, and registers the toggle keybinding.
+# ============================================================================
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Default options
-default_key='\'
-default_width="32"
-default_refresh="2"
-default_cpu_threshold="5"
+# ── Defaults ────────────────────────────────────────────────────
+DEFAULT_KEY='\'
+DEFAULT_WIDTH="32"
+DEFAULT_REFRESH="3"
+DEFAULT_CPU_THRESHOLD="5"
 
-# Read user-configurable options
+# ── Helpers ─────────────────────────────────────────────────────
 get_option() {
-  local option="$1"
-  local default="$2"
   local value
-  value="$(tmux show-option -gqv "$option")"
-  if [ -z "$value" ]; then
-    echo "$default"
-  else
-    echo "$value"
-  fi
+  value="$(tmux show-option -gqv "$1")"
+  [ -n "$value" ] && echo "$value" || echo "$2"
 }
 
-key="$(get_option "@opencode-key" "$default_key")"
-width="$(get_option "@opencode-sidebar-width" "$default_width")"
-refresh="$(get_option "@opencode-refresh-interval" "$default_refresh")"
-cpu_threshold="$(get_option "@opencode-cpu-threshold" "$default_cpu_threshold")"
+# ── Read User Config ────────────────────────────────────────────
+key="$(get_option "@opencode-key" "$DEFAULT_KEY")"
+width="$(get_option "@opencode-sidebar-width" "$DEFAULT_WIDTH")"
+refresh="$(get_option "@opencode-refresh-interval" "$DEFAULT_REFRESH")"
+cpu_threshold="$(get_option "@opencode-cpu-threshold" "$DEFAULT_CPU_THRESHOLD")"
 
-# Store config in tmux env for scripts to read
+# Store resolved config in tmux global env for render.sh to read
 tmux set-option -g @opencode-sidebar-width "$width"
 tmux set-option -g @opencode-refresh-interval "$refresh"
 tmux set-option -g @opencode-cpu-threshold "$cpu_threshold"
 
-# Register keybinding.
-# if-shell checks whether sidebar exists:
-#   - true  -> close it via run-shell
-#   - false -> open it via split-window (needs window context, which if-shell provides)
+# ── Register Keybinding ─────────────────────────────────────────
+# Uses tmux if-shell for the toggle:
+#   - check.sh returns 0 (sidebar exists)  -> close it via run-shell
+#   - check.sh returns 1 (no sidebar)      -> open via split-window
+#
+# split-window must run as a tmux command (not inside run-shell)
+# because it needs the current window context to create the pane.
 tmux bind-key "$key" \
   if-shell "$CURRENT_DIR/scripts/check.sh" \
     "run-shell '$CURRENT_DIR/scripts/close.sh'" \

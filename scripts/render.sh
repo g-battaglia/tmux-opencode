@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 
+# ============================================================================
 # render.sh - Main rendering loop for the tmux-opencode sidebar
-# Runs inside the sidebar pane, refreshes periodically, handles navigation
+# ============================================================================
 #
 # Architecture:
-#   - Input via read -t 1 (returns instantly on keypress, 1s timeout on idle)
-#   - Data (tmux sessions/panes/CPU) refreshed every N idle cycles
-#   - Synchronized output protocol (DEC 2026) for zero-flicker rendering
-#   - Alternate screen buffer for clean canvas
+#   - Single `tmux list-panes -a` call per refresh (not per-session/window)
+#   - Input polled via `read -t 1` (instant on keypress, 1s idle timeout)
+#   - Data refreshed every N idle seconds (configurable)
+#   - Synchronized output protocol (DEC 2026) for atomic frame rendering
+#   - Alternate screen buffer + stty raw mode for clean I/O
+#
+# Compatibility:
+#   - bash 3.2+ (macOS default) -- no bashisms requiring bash 4+
+#   - tmux 3.2+ (for split-window -f full-width splits)
+#   - macOS + Linux (ps/pgrep flags are POSIX-compatible)
+# ============================================================================
 
-# ── Colors (ANSI) ───────────────────────────────────────────────
+# ── ANSI Escape Codes ───────────────────────────────────────────
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
 DIM=$'\033[2m'
@@ -19,18 +27,16 @@ RED=$'\033[31m'
 CYAN=$'\033[36m'
 WHITE=$'\033[37m'
 BG_SELECT=$'\033[48;5;236m'
-CLR=$'\033[K'
-
-# Synchronized output sequences (Alacritty, kitty, iTerm2, etc.)
-SYNC_START=$'\033[?2026h'
-SYNC_END=$'\033[?2026l'
+CLR=$'\033[K'          # clear to end of line
+SYNC_START=$'\033[?2026h'  # begin synchronized output
+SYNC_END=$'\033[?2026l'    # end synchronized output
 
 # ── Symbols ─────────────────────────────────────────────────────
 DOT="●"
 LINE_V="│"
 DASH="─"
 
-# ── Config ──────────────────────────────────────────────────────
+# ── Read Config from tmux Environment ───────────────────────────
 get_option() {
   local value
   value="$(tmux show-option -gqv "$1" 2>/dev/null)"
@@ -42,52 +48,60 @@ CPU_THRESHOLD="$(get_option "@opencode-cpu-threshold" "5")"
 WIDTH="$(get_option "@opencode-sidebar-width" "32")"
 SIDEBAR_PANE="$(tmux display-message -p '#{pane_id}')"
 
-# Self-register so check.sh/close.sh can find us
+# Self-register so check.sh / close.sh can find this pane
 tmux set-option -g @opencode-sidebar-pane "$SIDEBAR_PANE"
+
+# ── Precomputed Constants ───────────────────────────────────────
+MAX_NAME=$((WIDTH - 10))   # max display name length
+DASH_LINE=""               # precomputed separator line
+for (( _i = 0; _i < WIDTH - 4; _i++ )); do
+  DASH_LINE+="$DASH"
+done
 
 # ── State ───────────────────────────────────────────────────────
 cursor=0
+nav_count=0          # total navigable items (updated by collect_data)
 needs_redraw=1
 idle_ticks=0
 
-item_types=()
-item_targets=()
-item_displays=()
-item_statuses=()
+item_types=()        # "header" | "window"
+item_targets=()      # tmux target string (session:win_idx) for windows
+item_displays=()     # formatted display string
+item_statuses=()     # "working" | "idle" | "done" | "error" | ""
 
 # ── Terminal Setup ──────────────────────────────────────────────
-# Save terminal state and disable echo + canonical mode
-# -echo: prevents arrow key bytes from appearing on screen
-# -icanon: char-at-a-time input (no line buffering)
-# Keeps opost enabled so \n works correctly in output
+# Save terminal state, then disable echo and canonical mode.
+# -echo:   prevents escape sequence bytes from leaking to display
+# -icanon: character-at-a-time input (no line buffering)
+# opost is kept enabled so \n translates to \r\n in output.
 saved_stty="$(stty -g 2>/dev/null)"
 stty -echo -icanon 2>/dev/null
 
-# Enter alternate screen buffer (like vim/less/htop)
-printf "\033[?1049h"
-# Hide cursor
-printf "\033[?25l"
-# Disable line wrap
-printf "\033[?7l"
+printf "\033[?1049h"   # enter alternate screen buffer
+printf "\033[?25l"     # hide cursor
+printf "\033[?7l"      # disable line wrap
 
-# ── Cleanup ─────────────────────────────────────────────────────
+# ── Cleanup (runs on exit, interrupt, or term signal) ───────────
 cleanup() {
   tmux set-option -gu @opencode-sidebar-pane 2>/dev/null || true
   printf "\033[?7h"        # re-enable line wrap
   printf "\033[?25h"       # show cursor
   printf "\033[?1049l"     # leave alternate screen buffer
-  stty "$saved_stty" 2>/dev/null || stty sane 2>/dev/null  # restore terminal
+  stty "$saved_stty" 2>/dev/null || stty sane 2>/dev/null
 }
 trap 'cleanup; exit 0' EXIT INT TERM
 
-# ── Functions ───────────────────────────────────────────────────
-
+# ── Status Detection ────────────────────────────────────────────
+# Determine the opencode status for a single pane.
+#   - If opencode is the foreground command: check CPU to distinguish
+#     "working" (agent active, CPU >= threshold) from "idle" (waiting).
+#   - If opencode is NOT running: check /tmp exit code file left by
+#     the optional `oc` wrapper to distinguish "done" from "error".
 get_opencode_status() {
-  local pane_pid="$1"
-  local pane_cmd="$2"
-  local pane_id="$3"
+  local pane_pid="$1" pane_cmd="$2" pane_id="$3"
 
   if [ "$pane_cmd" = "opencode" ]; then
+    # Find the actual opencode PID (child of the shell)
     local oc_pid
     oc_pid="$(pgrep -P "$pane_pid" -x opencode 2>/dev/null | head -1)"
     [ -z "$oc_pid" ] && oc_pid="$pane_pid"
@@ -107,7 +121,7 @@ get_opencode_status() {
     return
   fi
 
-  # Check exit code from wrapper (oc function)
+  # Opencode not running -- check exit code from `oc` wrapper
   local exitfile="/tmp/tmux-opencode/${pane_id//[^%0-9]/}"
   if [ -f "$exitfile" ]; then
     local code
@@ -120,8 +134,11 @@ get_opencode_status() {
   fi
 }
 
+# ── Data Collection ─────────────────────────────────────────────
+# Queries tmux for all sessions, windows, and panes in a single batch,
+# then checks opencode status for each relevant pane.
+# Sets needs_redraw=1 only if the data actually changed.
 collect_data() {
-  # Snapshot old state to detect changes
   local old_snap=""
   local i
   for i in "${!item_displays[@]}"; do
@@ -132,62 +149,70 @@ collect_data() {
   item_targets=()
   item_displays=()
   item_statuses=()
+  nav_count=0
 
+  # Fetch current session/window for the * marker
   local current_session current_window
   current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || current_session=""
   current_window="$(tmux display-message -p '#{window_index}' 2>/dev/null)" || current_window=""
 
-  local sessions
-  sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" || return
+  # Single batch call: all panes across all sessions
+  local all_panes
+  all_panes="$(tmux list-panes -a -F \
+    '#{session_name}|#{window_index}|#{window_name}|#{pane_id}|#{pane_pid}|#{pane_current_command}' \
+    2>/dev/null)" || return
 
-  while IFS= read -r session; do
-    [ -z "$session" ] && continue
+  local prev_session="" prev_window=""
 
-    item_types+=("header")
-    item_targets+=("")
-    item_displays+=("$session")
-    item_statuses+=("")
+  while IFS='|' read -r sess win_idx win_name p_id p_pid p_cmd; do
+    [ -z "$sess" ] && continue
+    [ "$p_id" = "$SIDEBAR_PANE" ] && continue
 
-    local windows
-    windows="$(tmux list-windows -t "$session" -F '#{window_index}|#{window_name}' 2>/dev/null)" || continue
+    # New session header
+    if [ "$sess" != "$prev_session" ]; then
+      prev_session="$sess"
+      prev_window=""
+      item_types+=("header")
+      item_targets+=("")
+      item_displays+=("$sess")
+      item_statuses+=("")
+    fi
 
-    while IFS='|' read -r win_idx win_name; do
-      [ -z "$win_idx" ] && continue
-
-      local target="${session}:${win_idx}"
-      local best_status=""
-      local panes
-      panes="$(tmux list-panes -t "$target" -F '#{pane_id}|#{pane_pid}|#{pane_current_command}' 2>/dev/null)" || continue
-
-      while IFS='|' read -r p_id p_pid p_cmd; do
-        [ "$p_id" = "$SIDEBAR_PANE" ] && continue
-        [ -z "$p_pid" ] && continue
-
-        local status
-        status="$(get_opencode_status "$p_pid" "$p_cmd" "$p_id")"
-
-        case "$status" in
-          working) best_status="working" ;;
-          error)   [ "$best_status" != "working" ] && best_status="error" ;;
-          idle)    [ "$best_status" != "working" ] && [ "$best_status" != "error" ] && best_status="idle" ;;
-          done)    [ "$best_status" != "working" ] && [ "$best_status" != "error" ] && [ "$best_status" != "idle" ] && best_status="done" ;;
-        esac
-      done <<< "$panes"
+    # New window entry
+    if [ "$sess:$win_idx" != "$prev_session:$prev_window" ]; then
+      prev_window="$win_idx"
 
       local marker=""
-      if [ "$session" = "$current_session" ] && [ "$win_idx" = "$current_window" ]; then
+      if [ "$sess" = "$current_session" ] && [ "$win_idx" = "$current_window" ]; then
         marker=" *"
       fi
 
       item_types+=("window")
-      item_targets+=("$target")
+      item_targets+=("${sess}:${win_idx}")
       item_displays+=("${win_idx}: ${win_name}${marker}")
-      item_statuses+=("$best_status")
-    done <<< "$windows"
+      item_statuses+=("")
+      nav_count=$((nav_count + 1))
+    fi
 
-  done <<< "$sessions"
+    # Check opencode status and merge into the window's status
+    local status
+    status="$(get_opencode_status "$p_pid" "$p_cmd" "$p_id")"
+    [ -z "$status" ] && continue
 
-  # Trigger redraw only if data changed
+    # Find the last window entry index and update its status
+    local last_idx=$(( ${#item_statuses[@]} - 1 ))
+    local cur="${item_statuses[$last_idx]}"
+
+    # Priority: working > error > idle > done
+    case "$status" in
+      working) item_statuses[$last_idx]="working" ;;
+      error)   [ "$cur" != "working" ] && item_statuses[$last_idx]="error" ;;
+      idle)    [ "$cur" != "working" ] && [ "$cur" != "error" ] && item_statuses[$last_idx]="idle" ;;
+      done)    [ -z "$cur" ] && item_statuses[$last_idx]="done" ;;
+    esac
+  done <<< "$all_panes"
+
+  # Only trigger redraw if data changed
   local new_snap=""
   for i in "${!item_displays[@]}"; do
     new_snap+="${item_displays[$i]}:${item_statuses[$i]}|"
@@ -195,18 +220,10 @@ collect_data() {
   [ "$old_snap" != "$new_snap" ] && needs_redraw=1
 }
 
-count_navigable() {
-  local count=0
-  local t
-  for t in "${item_types[@]}"; do
-    [ "$t" = "window" ] && count=$((count + 1))
-  done
-  echo "$count"
-}
+# ── Navigation Helpers ──────────────────────────────────────────
 
 get_selected_target() {
-  local nav=0
-  local i
+  local nav=0 i
   for i in "${!item_types[@]}"; do
     if [ "${item_types[$i]}" = "window" ]; then
       if [ "$nav" -eq "$cursor" ]; then
@@ -216,78 +233,6 @@ get_selected_target() {
       nav=$((nav + 1))
     fi
   done
-}
-
-render() {
-  local buf=""
-  local max_name=$((WIDTH - 10))
-  local line_width=$((WIDTH - 2))
-
-  # Begin synchronized output (terminal holds display until SYNC_END)
-  buf+="${SYNC_START}"
-
-  buf+="\033[H"  # cursor home
-  buf+="\n"
-  buf+="  ${BOLD}${CYAN}OPENCODE${RESET}${CLR}\n"
-  buf+="  ${DIM}"
-  local i
-  for ((i = 0; i < WIDTH - 4; i++)); do
-    buf+="$DASH"
-  done
-  buf+="${RESET}\n"
-
-  local nav=0
-  local prev_type=""
-
-  for i in "${!item_types[@]}"; do
-    local type="${item_types[$i]}"
-    local display="${item_displays[$i]}"
-    local status="${item_statuses[$i]}"
-
-    if [ "$type" = "header" ]; then
-      [ -n "$prev_type" ] && buf+="\n"
-      buf+="  ${BOLD}${WHITE}${display}${RESET}${CLR}\n"
-
-    elif [ "$type" = "window" ]; then
-      # Determine indicator color and char separately (no embedded RESET)
-      local ind_color="" ind_char=" "
-      case "$status" in
-        working) ind_color="$YELLOW"; ind_char="$DOT" ;;
-        idle)    ind_color="$GREEN";  ind_char="$DOT" ;;
-        done)    ind_color="$GREEN";  ind_char="$DOT" ;;
-        error)   ind_color="$RED";    ind_char="$DOT" ;;
-      esac
-
-      # Truncate
-      if [ "${#display}" -gt "$max_name" ]; then
-        display="${display:0:$((max_name - 2))}.."
-      fi
-
-      # Pad to fixed width
-      local padded
-      padded="$(printf "%-${max_name}s" "$display")"
-
-      if [ "$nav" -eq "$cursor" ]; then
-        # Selected: BG_SELECT spans entire line including after the dot
-        buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${ind_color}${ind_char}${BG_SELECT}  ${RESET}${CLR}\n"
-      else
-        buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${ind_color}${ind_char}${RESET}${CLR}\n"
-      fi
-
-      nav=$((nav + 1))
-    fi
-
-    prev_type="$type"
-  done
-
-  buf+="\n"
-  buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
-  buf+="\033[J"  # clear everything below
-
-  # End synchronized output (terminal flushes entire frame at once)
-  buf+="${SYNC_END}"
-
-  printf "%b" "$buf"
 }
 
 switch_to_selected() {
@@ -302,66 +247,133 @@ switch_to_selected() {
   exit 0
 }
 
+# ── Rendering ───────────────────────────────────────────────────
+# Builds the entire frame into a string buffer, then flushes it inside
+# a synchronized output block so the terminal renders it atomically.
+render() {
+  local buf=""
+
+  buf+="${SYNC_START}"     # tell terminal: hold display
+  buf+="\033[H"            # cursor home (overwrite in place)
+
+  # Title
+  buf+="\n"
+  buf+="  ${BOLD}${CYAN}OPENCODE${RESET}${CLR}\n"
+  buf+="  ${DIM}${DASH_LINE}${RESET}\n"
+
+  local nav=0
+  local prev_type=""
+  local i
+
+  for i in "${!item_types[@]}"; do
+    local type="${item_types[$i]}"
+    local display="${item_displays[$i]}"
+    local status="${item_statuses[$i]}"
+
+    if [ "$type" = "header" ]; then
+      [ -n "$prev_type" ] && buf+="\n"
+      buf+="  ${BOLD}${WHITE}${display}${RESET}${CLR}\n"
+
+    elif [ "$type" = "window" ]; then
+      # Indicator color and symbol (kept separate to avoid RESET inside BG_SELECT)
+      local ind_color="" ind_char=" "
+      case "$status" in
+        working) ind_color="$YELLOW"; ind_char="$DOT" ;;
+        idle)    ind_color="$GREEN";  ind_char="$DOT" ;;
+        done)    ind_color="$GREEN";  ind_char="$DOT" ;;
+        error)   ind_color="$RED";    ind_char="$DOT" ;;
+      esac
+
+      # Truncate long names
+      if [ "${#display}" -gt "$MAX_NAME" ]; then
+        display="${display:0:$((MAX_NAME - 2))}.."
+      fi
+
+      # Pad name to fixed width (no subshell fork)
+      local padded=""
+      printf -v padded "%-${MAX_NAME}s" "$display"
+
+      if [ "$nav" -eq "$cursor" ]; then
+        buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${ind_color}${ind_char}${BG_SELECT}  ${RESET}${CLR}\n"
+      else
+        buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${ind_color}${ind_char}${RESET}${CLR}\n"
+      fi
+
+      nav=$((nav + 1))
+    fi
+
+    prev_type="$type"
+  done
+
+  # Footer
+  buf+="\n"
+  buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
+  buf+="\033[J"            # clear any leftover lines below
+
+  buf+="${SYNC_END}"       # tell terminal: flush now
+  printf "%b" "$buf"
+}
+
 # ── Main Loop ───────────────────────────────────────────────────
 
 collect_data
 needs_redraw=1
 
 while true; do
-  # Clamp cursor
-  max="$(count_navigable)"
-  [ "$max" -eq 0 ] && max=1
-  [ "$cursor" -ge "$max" ] && cursor=$((max - 1))
+  # Clamp cursor to valid range
+  [ "$nav_count" -eq 0 ] && nav_count=1
+  [ "$cursor" -ge "$nav_count" ] && cursor=$((nav_count - 1))
   [ "$cursor" -lt 0 ] && cursor=0
 
-  # Redraw only when needed
+  # Redraw only when data or cursor changed
   if [ "$needs_redraw" -eq 1 ]; then
     render
     needs_redraw=0
   fi
 
-  # Wait for input (instant on keypress, 1s timeout on idle)
-  #   rc=0    -> got a character (or Enter = empty string with rc=0)
-  #   rc=1    -> EOF (tmux resize, signals, etc.) -- IGNORE, do not exit
-  #   rc>128  -> timeout (no input)
+  # Read one character with 1-second timeout.
+  # Exit codes:  0 = got input | 1 = EOF (ignore) | >128 = timeout
   key=""
   rc=0
   IFS= read -rsn1 -t 1 key || rc=$?
 
   if [ "$rc" -gt 128 ]; then
-    # Timeout -- count toward data refresh
+    # Timeout (no keypress for 1s) -- refresh data periodically
     idle_ticks=$((idle_ticks + 1))
     if [ "$idle_ticks" -ge "$REFRESH_SECS" ]; then
       idle_ticks=0
       collect_data
     fi
+
   elif [ "$rc" -eq 1 ]; then
-    # EOF -- ignore (tmux resize, focus event, etc.)
+    # EOF from tmux resize / focus event -- safe to ignore
     :
+
   elif [ "$rc" -eq 0 ] && [ -z "$key" ]; then
-    # Enter key (rc=0, empty string)
+    # Enter key (exit code 0 with empty string)
     switch_to_selected
-  elif [ "$rc" -eq 0 ] && [ -n "$key" ]; then
-    # Got a character
+
+  elif [ "$rc" -eq 0 ]; then
+    # Regular keypress
     case "$key" in
       j) cursor=$((cursor + 1)); needs_redraw=1 ;;
       k) cursor=$((cursor - 1)); needs_redraw=1 ;;
-      G) cursor=$(($(count_navigable) - 1)); needs_redraw=1 ;;
+      G) cursor=$((nav_count - 1)); needs_redraw=1 ;;
       g) cursor=0; needs_redraw=1 ;;
       q)
         tmux kill-pane -t "$SIDEBAR_PANE" 2>/dev/null || true
         exit 0
         ;;
       $'\x1b')
-        # Arrow key: ESC [ A/B
+        # Arrow keys arrive as ESC [ A/B
         bracket=""
         IFS= read -rsn1 -t 1 bracket 2>/dev/null || true
         if [ "$bracket" = "[" ]; then
           arrow=""
           IFS= read -rsn1 -t 1 arrow 2>/dev/null || true
           case "$arrow" in
-            A) cursor=$((cursor - 1)); needs_redraw=1 ;;  # Up
-            B) cursor=$((cursor + 1)); needs_redraw=1 ;;  # Down
+            A) cursor=$((cursor - 1)); needs_redraw=1 ;;
+            B) cursor=$((cursor + 1)); needs_redraw=1 ;;
           esac
         fi
         ;;
