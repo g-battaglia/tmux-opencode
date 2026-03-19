@@ -6,11 +6,8 @@
 # Architecture:
 #   - Input via read -t 1 (returns instantly on keypress, 1s timeout on idle)
 #   - Data (tmux sessions/panes/CPU) refreshed every N idle cycles
-#   - Uses cursor-home + clear-to-EOL to avoid flicker (no full clear)
-#   - Full frame buffered then flushed at once
-
-# Note: NOT using set -e because read -t returns >128 on timeout
-set -uo pipefail
+#   - Synchronized output protocol (DEC 2026) for zero-flicker rendering
+#   - Alternate screen buffer for clean canvas
 
 # ── Colors (ANSI) ───────────────────────────────────────────────
 RESET=$'\033[0m'
@@ -23,6 +20,10 @@ CYAN=$'\033[36m'
 WHITE=$'\033[37m'
 BG_SELECT=$'\033[48;5;236m'
 CLR=$'\033[K'
+
+# Synchronized output sequences (Alacritty, kitty, iTerm2, etc.)
+SYNC_START=$'\033[?2026h'
+SYNC_END=$'\033[?2026l'
 
 # ── Symbols ─────────────────────────────────────────────────────
 DOT="●"
@@ -49,22 +50,27 @@ cursor=0
 needs_redraw=1
 idle_ticks=0
 
-declare -a item_types=()
-declare -a item_targets=()
-declare -a item_displays=()
-declare -a item_statuses=()
+item_types=()
+item_targets=()
+item_displays=()
+item_statuses=()
+
+# ── Terminal Setup ──────────────────────────────────────────────
+# Enter alternate screen buffer (like vim/less/htop)
+printf "\033[?1049h"
+# Hide cursor
+tput civis 2>/dev/null || true
+# Disable line wrap
+printf "\033[?7l"
 
 # ── Cleanup ─────────────────────────────────────────────────────
 cleanup() {
   tmux set-option -gu @opencode-sidebar-pane 2>/dev/null || true
+  printf "\033[?7h"        # re-enable line wrap
   tput cnorm 2>/dev/null || true
-  printf "\033[?7h"  # re-enable line wrap
+  printf "\033[?1049l"     # leave alternate screen buffer
 }
 trap 'cleanup; exit 0' EXIT INT TERM
-
-# Hide cursor, disable line wrap
-tput civis 2>/dev/null || true
-printf "\033[?7l"
 
 # ── Functions ───────────────────────────────────────────────────
 
@@ -120,8 +126,8 @@ collect_data() {
   item_statuses=()
 
   local current_session current_window
-  current_session="$(tmux display-message -p '#{session_name}')"
-  current_window="$(tmux display-message -p '#{window_index}')"
+  current_session="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || current_session=""
+  current_window="$(tmux display-message -p '#{window_index}' 2>/dev/null)" || current_window=""
 
   local sessions
   sessions="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" || return
@@ -183,6 +189,7 @@ collect_data() {
 
 count_navigable() {
   local count=0
+  local t
   for t in "${item_types[@]}"; do
     [ "$t" = "window" ] && count=$((count + 1))
   done
@@ -191,6 +198,7 @@ count_navigable() {
 
 get_selected_target() {
   local nav=0
+  local i
   for i in "${!item_types[@]}"; do
     if [ "${item_types[$i]}" = "window" ]; then
       if [ "$nav" -eq "$cursor" ]; then
@@ -202,12 +210,15 @@ get_selected_target() {
   done
 }
 
-# Build entire frame into a buffer, flush at once (zero flicker)
 render() {
   local buf=""
   local max_name=$((WIDTH - 10))
+  local line_width=$((WIDTH - 2))
 
-  buf+="\033[H"  # cursor home (overwrite in place, no clear)
+  # Begin synchronized output (terminal holds display until SYNC_END)
+  buf+="${SYNC_START}"
+
+  buf+="\033[H"  # cursor home
   buf+="\n"
   buf+="  ${BOLD}${CYAN}OPENCODE${RESET}${CLR}\n"
   buf+="  ${DIM}"
@@ -230,12 +241,13 @@ render() {
       buf+="  ${BOLD}${WHITE}${display}${RESET}${CLR}\n"
 
     elif [ "$type" = "window" ]; then
-      local indicator=" "
+      # Determine indicator color and char separately (no embedded RESET)
+      local ind_color="" ind_char=" "
       case "$status" in
-        working) indicator="${YELLOW}${DOT}${RESET}" ;;
-        idle)    indicator="${GREEN}${DOT}${RESET}" ;;
-        done)    indicator="${GREEN}${DOT}${RESET}" ;;
-        error)   indicator="${RED}${DOT}${RESET}" ;;
+        working) ind_color="$YELLOW"; ind_char="$DOT" ;;
+        idle)    ind_color="$GREEN";  ind_char="$DOT" ;;
+        done)    ind_color="$GREEN";  ind_char="$DOT" ;;
+        error)   ind_color="$RED";    ind_char="$DOT" ;;
       esac
 
       # Truncate
@@ -248,9 +260,10 @@ render() {
       padded="$(printf "%-${max_name}s" "$display")"
 
       if [ "$nav" -eq "$cursor" ]; then
-        buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${indicator}  ${RESET}${CLR}\n"
+        # Selected: BG_SELECT spans entire line including after the dot
+        buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${ind_color}${ind_char}${BG_SELECT}  ${RESET}${CLR}\n"
       else
-        buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${indicator}${CLR}\n"
+        buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${ind_color}${ind_char}${RESET}${CLR}\n"
       fi
 
       nav=$((nav + 1))
@@ -262,6 +275,9 @@ render() {
   buf+="\n"
   buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
   buf+="\033[J"  # clear everything below
+
+  # End synchronized output (terminal flushes entire frame at once)
+  buf+="${SYNC_END}"
 
   printf "%b" "$buf"
 }
@@ -280,7 +296,6 @@ switch_to_selected() {
 
 # ── Main Loop ───────────────────────────────────────────────────
 
-# Initial data load
 collect_data
 needs_redraw=1
 
@@ -298,25 +313,27 @@ while true; do
   fi
 
   # Wait for input (instant on keypress, 1s timeout on idle)
-  # Capture exit code BEFORE || true masks it:
-  #   0   = got a character (or Enter which gives empty string)
-  #   1   = EOF
-  #   >128 = timeout
+  #   rc=0    -> got a character (or Enter = empty string with rc=0)
+  #   rc=1    -> EOF (tmux resize, signals, etc.) -- IGNORE, do not exit
+  #   rc>128  -> timeout (no input)
   key=""
   rc=0
   IFS= read -rsn1 -t 1 key || rc=$?
 
   if [ "$rc" -gt 128 ]; then
-    # Timeout -- no input for 1 second, count toward data refresh
+    # Timeout -- count toward data refresh
     idle_ticks=$((idle_ticks + 1))
     if [ "$idle_ticks" -ge "$REFRESH_SECS" ]; then
       idle_ticks=0
       collect_data
     fi
-  elif [ -z "$key" ]; then
-    # Enter key (read returned 0 with empty string)
+  elif [ "$rc" -eq 1 ]; then
+    # EOF -- ignore (tmux resize, focus event, etc.)
+    :
+  elif [ "$rc" -eq 0 ] && [ -z "$key" ]; then
+    # Enter key (rc=0, empty string)
     switch_to_selected
-  else
+  elif [ "$rc" -eq 0 ] && [ -n "$key" ]; then
     # Got a character
     case "$key" in
       j) cursor=$((cursor + 1)); needs_redraw=1 ;;
