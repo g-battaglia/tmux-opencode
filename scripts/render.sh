@@ -63,6 +63,11 @@ cursor=0
 nav_count=0          # total navigable items (updated by collect_data)
 needs_redraw=1
 idle_ticks=0
+scroll_offset=0
+
+# ── Hysteresis & Tracking ──────────────────────────────────────
+prev_pane_statuses=""   # ";pane_id=status;..." for CPU hysteresis
+seen_oc_panes=""        # ";pane_id;..." panes where opencode was seen
 
 item_types=()        # "header" | "window"
 item_targets=()      # tmux target string (session:win_idx) for windows
@@ -95,12 +100,22 @@ trap 'cleanup; exit 0' EXIT INT TERM
 # Determine the opencode status for a single pane.
 #   - If opencode is the foreground command: check CPU to distinguish
 #     "working" (agent active, CPU >= threshold) from "idle" (waiting).
+#     Uses hysteresis: idle->working at CPU_THRESHOLD, working->idle
+#     at CPU_THRESHOLD/2, to prevent flip-flop near the boundary.
 #   - If opencode is NOT running: check /tmp exit code file left by
-#     the optional `oc` wrapper to distinguish "done" from "error".
+#     the shell hook (or `oc` wrapper) to distinguish "done" from "error".
+#   - If opencode was previously seen but is now gone and no exit file
+#     exists, returns "exited" (neutral indicator).
 get_opencode_status() {
   local pane_pid="$1" pane_cmd="$2" pane_id="$3"
 
   if [ "$pane_cmd" = "opencode" ]; then
+    # Track this pane as having opencode running
+    case "$seen_oc_panes" in
+      *";${pane_id};"*) ;;
+      *) seen_oc_panes="${seen_oc_panes};${pane_id};" ;;
+    esac
+
     # Find the actual opencode PID (child of the shell)
     local oc_pid
     oc_pid="$(pgrep -P "$pane_pid" -x opencode 2>/dev/null | head -1)"
@@ -113,15 +128,56 @@ get_opencode_status() {
     local cpu_int="${cpu%%.*}"
     [ -z "$cpu_int" ] && cpu_int=0
 
-    if [ "$cpu_int" -ge "$CPU_THRESHOLD" ]; then
-      echo "working"
+    # Hysteresis: look up previous status for this pane
+    local prev_st=""
+    case "$prev_pane_statuses" in
+      *";${pane_id}="*)
+        prev_st="${prev_pane_statuses#*;${pane_id}=}"
+        prev_st="${prev_st%%;*}"
+        ;;
+    esac
+
+    local low_threshold=$(( CPU_THRESHOLD / 2 ))
+    [ "$low_threshold" -lt 1 ] && low_threshold=1
+
+    local new_st
+    if [ "$prev_st" = "working" ]; then
+      # working -> idle only if CPU drops below low threshold
+      if [ "$cpu_int" -lt "$low_threshold" ]; then
+        new_st="idle"
+      else
+        new_st="working"
+      fi
     else
-      echo "idle"
+      # idle/unknown -> working if CPU >= threshold
+      if [ "$cpu_int" -ge "$CPU_THRESHOLD" ]; then
+        new_st="working"
+      else
+        new_st="idle"
+      fi
     fi
+
+    # Store current status for next cycle
+    # Remove old entry if present, then append new
+    case "$prev_pane_statuses" in
+      *";${pane_id}="*)
+        local before="${prev_pane_statuses%%;${pane_id}=*}"
+        local after="${prev_pane_statuses#*;${pane_id}=}"
+        # Strip the current entry's value to get remaining entries
+        case "$after" in
+          *";"*) after=";${after#*;}" ;;
+          *)     after="" ;;
+        esac
+        prev_pane_statuses="${before}${after}"
+        ;;
+    esac
+    prev_pane_statuses="${prev_pane_statuses};${pane_id}=${new_st}"
+
+    echo "$new_st"
     return
   fi
 
-  # Opencode not running -- check exit code from `oc` wrapper
+  # Opencode not running -- check exit code file (from shell hook or `oc` wrapper)
   local exitfile="/tmp/tmux-opencode/${pane_id//[^%0-9]/}"
   if [ -f "$exitfile" ]; then
     local code
@@ -131,7 +187,15 @@ get_opencode_status() {
     elif [ -n "$code" ]; then
       echo "error"
     fi
+    return
   fi
+
+  # No exit file -- was opencode previously seen in this pane?
+  case "$seen_oc_panes" in
+    *";${pane_id};"*)
+      echo "exited"
+      ;;
+  esac
 }
 
 # ── Data Collection ─────────────────────────────────────────────
@@ -203,12 +267,13 @@ collect_data() {
     local last_idx=$(( ${#item_statuses[@]} - 1 ))
     local cur="${item_statuses[$last_idx]}"
 
-    # Priority: working > error > idle > done
+    # Priority: working > error > idle > done > exited
     case "$status" in
       working) item_statuses[$last_idx]="working" ;;
       error)   [ "$cur" != "working" ] && item_statuses[$last_idx]="error" ;;
       idle)    [ "$cur" != "working" ] && [ "$cur" != "error" ] && item_statuses[$last_idx]="idle" ;;
-      done)    [ -z "$cur" ] && item_statuses[$last_idx]="done" ;;
+      done)    [ -z "$cur" ] || [ "$cur" = "exited" ] && item_statuses[$last_idx]="done" ;;
+      exited)  [ -z "$cur" ] && item_statuses[$last_idx]="exited" ;;
     esac
   done <<< "$all_panes"
 
@@ -250,20 +315,72 @@ switch_to_selected() {
 # ── Rendering ───────────────────────────────────────────────────
 # Builds the entire frame into a string buffer, then flushes it inside
 # a synchronized output block so the terminal renders it atomically.
+# Implements viewport scrolling: only renders lines visible within the
+# terminal height, adjusting scroll_offset to keep the cursor in view.
 render() {
+  # Get terminal dimensions for viewport
+  local term_lines
+  term_lines="$(tput lines 2>/dev/null)" || term_lines=24
+  local viewport_height=$((term_lines - 5))  # 3 top (blank+title+dash) + 2 bottom (blank+footer)
+  [ "$viewport_height" -lt 3 ] && viewport_height=3
+
+  # ── Pre-pass: count content lines and find cursor's line index ──
+  local total_lines=0
+  local cursor_line=0
+  local nav=0
+  local prev_type=""
+  local i
+
+  for i in "${!item_types[@]}"; do
+    local type="${item_types[$i]}"
+
+    if [ "$type" = "header" ]; then
+      [ -n "$prev_type" ] && total_lines=$((total_lines + 1))  # blank separator
+      total_lines=$((total_lines + 1))  # header line
+    elif [ "$type" = "window" ]; then
+      if [ "$nav" -eq "$cursor" ]; then
+        cursor_line=$total_lines
+      fi
+      total_lines=$((total_lines + 1))
+      nav=$((nav + 1))
+    fi
+
+    prev_type="$type"
+  done
+
+  # ── Adjust scroll offset to keep cursor visible ──
+  if [ "$cursor_line" -lt "$scroll_offset" ]; then
+    scroll_offset=$cursor_line
+  elif [ "$cursor_line" -ge $((scroll_offset + viewport_height)) ]; then
+    scroll_offset=$((cursor_line - viewport_height + 1))
+  fi
+  [ "$scroll_offset" -lt 0 ] && scroll_offset=0
+
+  local has_above=0
+  local has_below=0
+  [ "$scroll_offset" -gt 0 ] && has_above=1
+  [ $((scroll_offset + viewport_height)) -lt "$total_lines" ] && has_below=1
+
+  # ── Build frame ──
   local buf=""
+  local visible_end=$((scroll_offset + viewport_height))
 
   buf+="${SYNC_START}"     # tell terminal: hold display
   buf+="\033[H"            # cursor home (overwrite in place)
 
-  # Title
+  # Title (with scroll-up indicator when content is above viewport)
   buf+="\n"
-  buf+="  ${BOLD}${CYAN}OPENCODE${RESET}${CLR}\n"
+  if [ "$has_above" -eq 1 ]; then
+    buf+="  ${BOLD}${CYAN}OPENCODE${RESET}  ${DIM}▲${RESET}${CLR}\n"
+  else
+    buf+="  ${BOLD}${CYAN}OPENCODE${RESET}${CLR}\n"
+  fi
   buf+="  ${DIM}${DASH_LINE}${RESET}\n"
 
-  local nav=0
-  local prev_type=""
-  local i
+  # ── Render only visible content lines ──
+  local line_idx=0
+  nav=0
+  prev_type=""
 
   for i in "${!item_types[@]}"; do
     local type="${item_types[$i]}"
@@ -271,43 +388,62 @@ render() {
     local status="${item_statuses[$i]}"
 
     if [ "$type" = "header" ]; then
-      [ -n "$prev_type" ] && buf+="\n"
-      buf+="  ${BOLD}${WHITE}${display}${RESET}${CLR}\n"
+      # Blank separator before header (except first)
+      if [ -n "$prev_type" ]; then
+        if [ "$line_idx" -ge "$scroll_offset" ] && [ "$line_idx" -lt "$visible_end" ]; then
+          buf+="\n"
+        fi
+        line_idx=$((line_idx + 1))
+      fi
+
+      # Header line
+      if [ "$line_idx" -ge "$scroll_offset" ] && [ "$line_idx" -lt "$visible_end" ]; then
+        buf+="  ${BOLD}${WHITE}${display}${RESET}${CLR}\n"
+      fi
+      line_idx=$((line_idx + 1))
 
     elif [ "$type" = "window" ]; then
-      # Indicator color and symbol (kept separate to avoid RESET inside BG_SELECT)
-      local ind_color="" ind_char=" "
-      case "$status" in
-        working) ind_color="$YELLOW"; ind_char="$DOT" ;;
-        idle)    ind_color="$GREEN";  ind_char="$DOT" ;;
-        done)    ind_color="$GREEN";  ind_char="$DOT" ;;
-        error)   ind_color="$RED";    ind_char="$DOT" ;;
-      esac
+      if [ "$line_idx" -ge "$scroll_offset" ] && [ "$line_idx" -lt "$visible_end" ]; then
+        # Indicator color and symbol (kept separate to avoid RESET inside BG_SELECT)
+        local ind_color="" ind_char=" "
+        case "$status" in
+          working) ind_color="$YELLOW"; ind_char="$DOT" ;;
+          idle)    ind_color="$GREEN";  ind_char="$DOT" ;;
+          done)    ind_color="$GREEN";  ind_char="$DOT" ;;
+          error)   ind_color="$RED";    ind_char="$DOT" ;;
+          exited)  ind_color="$DIM";    ind_char="$DOT" ;;
+        esac
 
-      # Truncate long names
-      if [ "${#display}" -gt "$MAX_NAME" ]; then
-        display="${display:0:$((MAX_NAME - 2))}.."
+        # Truncate long names
+        if [ "${#display}" -gt "$MAX_NAME" ]; then
+          display="${display:0:$((MAX_NAME - 2))}.."
+        fi
+
+        # Pad name to fixed width (no subshell fork)
+        local padded=""
+        printf -v padded "%-${MAX_NAME}s" "$display"
+
+        if [ "$nav" -eq "$cursor" ]; then
+          buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${ind_color}${ind_char}${BG_SELECT}  ${RESET}${CLR}\n"
+        else
+          buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${ind_color}${ind_char}${RESET}${CLR}\n"
+        fi
       fi
 
-      # Pad name to fixed width (no subshell fork)
-      local padded=""
-      printf -v padded "%-${MAX_NAME}s" "$display"
-
-      if [ "$nav" -eq "$cursor" ]; then
-        buf+="  ${BG_SELECT}${WHITE}${LINE_V} ${padded}  ${ind_color}${ind_char}${BG_SELECT}  ${RESET}${CLR}\n"
-      else
-        buf+="  ${DIM}${LINE_V}${RESET} ${padded}  ${ind_color}${ind_char}${RESET}${CLR}\n"
-      fi
-
+      line_idx=$((line_idx + 1))
       nav=$((nav + 1))
     fi
 
     prev_type="$type"
   done
 
-  # Footer
+  # Footer (with scroll-down indicator when content is below viewport)
   buf+="\n"
-  buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
+  if [ "$has_below" -eq 1 ]; then
+    buf+="  ${DIM}↑↓ move  enter go  q close ▼${RESET}${CLR}\n"
+  else
+    buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
+  fi
   buf+="\033[J"            # clear any leftover lines below
 
   buf+="${SYNC_END}"       # tell terminal: flush now

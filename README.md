@@ -86,11 +86,30 @@ The plugin detects OpenCode status by checking CPU usage of each process:
 - **Working** (yellow): CPU ≥ 5% — agent running, tools executing, LLM streaming
 - **Idle** (green): CPU < 5% — waiting for user input
 
+The plugin uses hysteresis to prevent status flickering near the CPU threshold: transitioning from idle to working requires CPU ≥ 5%, but transitioning back from working to idle requires CPU to drop below 2.5%. This eliminates rapid yellow/green toggling.
+
 The current window is marked with `*`.
 
-### Error Detection (optional)
+### Exit Code Detection
 
-To enable red indicators for crashed sessions, add this to your `~/.zshrc` or `~/.bashrc`:
+To enable red/green indicators after OpenCode exits, add this to your `~/.zshrc` or `~/.bashrc`:
+
+```bash
+source ~/.tmux/plugins/tmux-opencode/scripts/shell-hook.sh
+```
+
+The hook automatically detects when `opencode` exits and captures the exit code. No need to use a wrapper or alias — just run `opencode` as usual. The plugin will show:
+
+- `●` green — exited successfully (exit code 0)
+- `●` red — exited with error (exit code > 0)
+- `●` dim — exited but no exit code available (hook not installed)
+
+> **Note**: The hook only activates inside tmux sessions and has zero overhead for non-opencode commands.
+
+<details>
+<summary>Alternative: manual <code>oc</code> wrapper (legacy)</summary>
+
+If you prefer not to source the hook, you can define a wrapper function instead:
 
 ```bash
 oc() {
@@ -104,10 +123,9 @@ oc() {
 }
 ```
 
-Launch with `oc` instead of `opencode`. The plugin will show:
+Launch with `oc` instead of `opencode`.
 
-- `●` green — exited successfully (exit code 0)
-- `●` red — exited with error (exit code > 0)
+</details>
 
 ## Configuration
 
