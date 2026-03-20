@@ -58,6 +58,14 @@ for (( _i = 0; _i < WIDTH - 4; _i++ )); do
   DASH_LINE+="$DASH"
 done
 
+# ── Terminal Height (cached, updated on SIGWINCH) ───────────────
+term_lines="$(tput lines 2>/dev/null)" || term_lines=24
+update_term_size() {
+  term_lines="$(tput lines 2>/dev/null)" || term_lines=24
+  needs_redraw=1
+}
+trap 'update_term_size' WINCH
+
 # ── State ───────────────────────────────────────────────────────
 cursor=0
 nav_count=0          # total navigable items (updated by collect_data)
@@ -318,15 +326,15 @@ switch_to_selected() {
 # Implements viewport scrolling: only renders lines visible within the
 # terminal height, adjusting scroll_offset to keep the cursor in view.
 render() {
-  # Get terminal dimensions for viewport
-  local term_lines
-  term_lines="$(tput lines 2>/dev/null)" || term_lines=24
+  # Viewport height from cached term_lines (updated by SIGWINCH trap)
   local viewport_height=$((term_lines - 5))  # 3 top (blank+title+dash) + 2 bottom (blank+footer)
   [ "$viewport_height" -lt 3 ] && viewport_height=3
 
-  # ── Pre-pass: count content lines and find cursor's line index ──
+  # ── Pre-pass: count content lines, find cursor line & its session header ──
   local total_lines=0
   local cursor_line=0
+  local cursor_header_line=0   # line index of the header above the cursor
+  local last_header_line=0     # tracks the most recent header line
   local nav=0
   local prev_type=""
   local i
@@ -336,10 +344,12 @@ render() {
 
     if [ "$type" = "header" ]; then
       [ -n "$prev_type" ] && total_lines=$((total_lines + 1))  # blank separator
+      last_header_line=$total_lines
       total_lines=$((total_lines + 1))  # header line
     elif [ "$type" = "window" ]; then
       if [ "$nav" -eq "$cursor" ]; then
         cursor_line=$total_lines
+        cursor_header_line=$last_header_line
       fi
       total_lines=$((total_lines + 1))
       nav=$((nav + 1))
@@ -349,8 +359,11 @@ render() {
   done
 
   # ── Adjust scroll offset to keep cursor visible ──
+  # When scrolling up, show the session header above the cursor so the
+  # user always sees which session the selected window belongs to.
   if [ "$cursor_line" -lt "$scroll_offset" ]; then
-    scroll_offset=$cursor_line
+    # Include the session header (and its blank separator) in view
+    scroll_offset=$cursor_header_line
   elif [ "$cursor_line" -ge $((scroll_offset + viewport_height)) ]; then
     scroll_offset=$((cursor_line - viewport_height + 1))
   fi
