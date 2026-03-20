@@ -59,9 +59,16 @@ for (( _i = 0; _i < WIDTH - 4; _i++ )); do
 done
 
 # ── Terminal Height (cached, updated on SIGWINCH) ───────────────
-term_lines="$(tput lines 2>/dev/null)" || term_lines=24
+# Uses tmux pane_height instead of tput lines because tput returns
+# stale defaults (24) when the pane has just been created.
+get_pane_height() {
+  local h
+  h="$(tmux display-message -t "$SIDEBAR_PANE" -p '#{pane_height}' 2>/dev/null)"
+  [ -n "$h" ] && echo "$h" || echo 24
+}
+term_lines="$(get_pane_height)"
 update_term_size() {
-  term_lines="$(tput lines 2>/dev/null)" || term_lines=24
+  term_lines="$(get_pane_height)"
   needs_redraw=1
 }
 trap 'update_term_size' WINCH
