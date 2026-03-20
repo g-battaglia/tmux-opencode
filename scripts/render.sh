@@ -450,14 +450,18 @@ render() {
     prev_type="$type"
   done
 
-  # Footer (with scroll-down indicator when content is below viewport)
+  # Clear everything from end of content to bottom of screen,
+  # then position footer at the last two rows of the terminal.
+  buf+="\033[J"            # clear from content end to screen bottom
+  buf+="\033[$((term_lines - 1));1H"  # jump to second-to-last row
+
+  # Footer (anchored to bottom, with scroll-down indicator)
   buf+="\n"
   if [ "$has_below" -eq 1 ]; then
-    buf+="  ${DIM}↑↓ move  enter go  q close ▼${RESET}${CLR}\n"
+    buf+="  ${DIM}↑↓ move  enter go  q close ▼${RESET}${CLR}"
   else
-    buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}\n"
+    buf+="  ${DIM}↑↓ move  enter go  q close${RESET}${CLR}"
   fi
-  buf+="\033[J"            # clear any leftover lines below
 
   buf+="${SYNC_END}"       # tell terminal: flush now
   printf "%b" "$buf"
